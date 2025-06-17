@@ -15,6 +15,7 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
 
     error dTSLA__NotEnoughTSLA();
     error dTSLA__InsufficientWithdrawalAmount();
+    error dTSLA__UsdcTransferFailed();
 
     enum mintOrRedeem {
         MINT,
@@ -41,6 +42,7 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
         0xb83E47C2bC239B3bf370bc41e1459A34b41238D0;
     address public constant SEPOLIA_TSLA_PRICE_FEED =
         0xc59E3633BAAC79493d908e63626716e204A45EdF; // This is LINK/USD price feed on Sepolia for demo
+    address public constant SEPOLIA_USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
     bytes32 public s_lastRequestId;
     uint64 immutable i_subId;
     uint32 public constant MAX_GAS_LIMIT = 500_000; // Maximum gas limit for the mint request
@@ -51,6 +53,7 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
     string public s_redeemSource;
     mapping(bytes32 requestId => dTslaRequest request)
         private s_requestIdToRequest;
+    mapping(address user => uint256 amount) private s_userToWithdrawalAmount;
 
     event Mint(address indexed requester, uint256 amount);
     event UnexpectedRequestID(bytes32 indexed requestId);
@@ -69,6 +72,10 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
         i_subId = _subId;
         s_redeemSource = _redeemSource;
     }
+
+    /*//////////////////////////////////////////////////////////////
+                      PUBLIC & EXTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
 
     /// @notice Sends a mint request for the dTSLA token.
     /// @dev This function interacts with an external service to verify TSLA purchase and mints tokens accordingly.
@@ -95,10 +102,63 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
             action: mintOrRedeem.MINT
         });
 
-        emit Mint(msg.sender, amount); // Emit the Mint event
-
         return s_lastRequestId;
     }
+
+    /// @notice Sends a redeem request to sell TSLA for USDC.
+    /// This function have the chainlink oracle to:
+    /// 1. Sell TSLA on the brokerage
+    /// 2. Buy USDC on the brokerage and send it to the dTSLA contract
+    function sendRedeemRequest(uint256 amountOfDTsla) external {
+        uint256 amountTslaInUsdc = (amountOfDTsla * getTslaPrice()) / PRECISION;
+        // Makesure the amount is greater than the minimum withdrawal amount
+        if (amountTslaInUsdc < MIN_WITHDRAWAL_AMOUNT) {
+            revert dTSLA__InsufficientWithdrawalAmount();
+        }
+
+        FunctionsRequest.Request memory req;
+        req._initializeRequestForInlineJavaScript(s_redeemSource); 
+
+        string[] memory args = new string[](2); // Tell the brokerage how much TSLA to sell and how much USDC to send back
+        args[0] = amountOfDTsla.toString();
+        args[1] = amountTslaInUsdc.toString();
+        req._setArgs(args);
+
+        // Send the request and store the request ID
+        s_lastRequestId = _sendRequest(
+            req._encodeCBOR(),
+            i_subId,
+            MAX_GAS_LIMIT,
+            DON_ID
+        );
+        s_requestIdToRequest[s_lastRequestId] = dTslaRequest({
+            amountOfToken: amountOfDTsla,
+            requester: msg.sender,
+            action: mintOrRedeem.REDEEM
+        });
+
+        // External Interactions
+        _burn(msg.sender, amountOfDTsla);
+    }
+
+    function withdraw() external {
+        uint256 amount = s_userToWithdrawalAmount[msg.sender];
+        if (amount < MIN_WITHDRAWAL_AMOUNT) {
+            revert dTSLA__InsufficientWithdrawalAmount();
+        }
+        // Reset the withdrawal amount for the user
+        s_userToWithdrawalAmount[msg.sender] = 0;
+
+        // Transfer USDC to the user
+        bool success = ERC20(SEPOLIA_USDC).transfer(msg.sender, amount);
+        if (!success) {
+            revert dTSLA__UsdcTransferFailed();
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                      PRIVATE & INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
 
     /// @notice Internal function to fulfill the mint request.
     /// Chainlink functions the amount of TSLA value (in USD) stored in our brokerage account.
@@ -126,42 +186,21 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
         }
     }
 
-    /// @notice Sends a redeem request to sell TSLA for USDC.
-    /// This function have the chainlink oracle to:
-    /// 1. Sell TSLA on the brokerage
-    /// 2. Buy USDC on the brokerage and send it to the dTSLA contract
-    function sendRedeemRequest(uint256 amountOfDTsla) external {
-        uint256 amountTslaInUsdc = (amountOfDTsla * getTslaPrice()) / PRECISION;
-        // Makesure the amount is greater than the minimum withdrawal amount
-        if (amountTslaInUsdc < MIN_WITHDRAWAL_AMOUNT) {
-            revert dTSLA__InsufficientWithdrawalAmount();
-        }
-
-        FunctionsRequest.Request memory req;
-        req._initializeRequestForInlineJavaScript(s_redeemSource); 
-        string[] memory args = new string[](2);
-        args[0] = amountOfDTsla.toString();
-        req._setArgs(args);
-
-        // Send the request and store the request ID
-        s_lastRequestId = _sendRequest(
-            req._encodeCBOR(),
-            i_subId,
-            MAX_GAS_LIMIT,
-            DON_ID
-        );
-        s_requestIdToRequest[s_lastRequestId] = dTslaRequest({
-            amountOfToken: amountOfDTsla,
-            requester: msg.sender,
-            action: mintOrRedeem.REDEEM
-        });
-
-        // External Interactions
-        _burn(msg.sender, amountOfDTsla);
-    }
 
     function _redeemFulfillRequest(bytes32 requestId, bytes memory response) internal {
-
+        uint256 usdcAmount = uint256(bytes32(response));
+        if(usdcAmount == 0) {
+            uint256 amountOfDTslaBurned = s_requestIdToRequest[requestId].amountOfToken;
+            // Mint the dTSLA tokens back to the requester
+            _mint(
+                s_requestIdToRequest[requestId].requester,
+                amountOfDTslaBurned
+            ); 
+            emit Mint(s_requestIdToRequest[requestId].requester, amountOfDTslaBurned);
+        }
+ 
+        // Let the user withdraw the USDC later
+        s_userToWithdrawalAmount[s_requestIdToRequest[requestId].requester] += usdcAmount;
     }
 
     /**
