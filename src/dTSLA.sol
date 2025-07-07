@@ -161,7 +161,7 @@ contract dTSLA is FunctionsClient, ConfirmedOwner, Pausable, ERC20 {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Internal function to fulfill the mint request.
-    /// Chainlink functions the amount of TSLA value (in USD) stored in our brokerage account.
+    /// Chainlink functions check the amount of TSLA value (in USD) stored in our brokerage account.
     /// If the amount is sufficient, it mints the dTSLA tokens to the requester.
     function _mintFulfillRequest(
         bytes32 requestId,

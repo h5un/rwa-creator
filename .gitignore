@@ -16,3 +16,6 @@ docs/
 # Library files
 lib/
 headers/
+
+# Build files
+node_modules/
