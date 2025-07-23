@@ -4,6 +4,7 @@
     "uploadSecrets": "source .env && node ./functions/uploadSecrets.js"
   },
   "dependencies": {
-    "@chainlink/functions-toolkit": "^0.3.2"
+    "@chainlink/functions-toolkit": "^0.3.2",
+    "secp256k1": "^5.0.1"
   }
 }
